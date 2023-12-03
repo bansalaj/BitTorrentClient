@@ -5,12 +5,15 @@
 #include <cstdlib>
 #include <fstream>
 #include <sstream>
+#include <cerrno>
+#include <cstring>
 #include <openssl/sha.h>
 #include <curl/curl.h>
 #ifndef WIN32
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <unistd.h>
 #endif
 
 #include "lib/nlohmann/json.hpp"
@@ -548,17 +551,17 @@ int SendRecvHandShake(std::string torrent_file, std::string ipaddress, int &sock
     return 0;
 }
 
-void downloadPiece(const std::string& torrent, int piece_index, const std::string& output_path)
+void downloadPiece(const std::string& torrent, int piece_index, const std::string& output_path, int& sock)
 {
-    int sock = 0;
+    //int sock = 0;
     auto info = decode_bencoded_info(torrent);
-    auto fullUrl = constructUrlFromTorrent(torrent);
-    auto response = makeGetRequest(fullUrl);
+    // auto fullUrl = constructUrlFromTorrent(torrent);
+    // auto response = makeGetRequest(fullUrl);
 
-    auto ip_port = getIpAddress(response);
+    // auto ip_port = getIpAddress(response);
     //std::cout << "ip:port" << ip_port << std::endl;
 
-    SendRecvHandShake(torrent, ip_port, sock);
+    //SendRecvHandShake(torrent, ip_port, sock);
 
     sendInterested(sock);
     waitForUnchoke(sock);
@@ -633,6 +636,60 @@ void downloadPiece(const std::string& torrent, int piece_index, const std::strin
     std::cout << "Piece " << piece_index << " downloaded to " << output_path << std::endl;
 }
 
+
+void mergePieces(const std::string& output_path, int num_pieces) {
+    std::ofstream outfile(output_path, std::ios::binary | std::ios::out);
+    if (!outfile.is_open()) {
+        std::cerr << "Failed to open output file for merging: " << output_path << std::endl;
+        return;
+    }
+
+    for (int piece_index = 0 ; piece_index < num_pieces ; ++piece_index) {
+        std::string piece_path = output_path + "_piece_" + std::to_string(piece_index);
+        std::ifstream inFile(piece_path, std::ios::binary | std::ios::in);
+
+        if (!inFile.is_open()) {
+            std::cerr << "Failed to open piece file: " << piece_path << " (Error: " << std::strerror(errno) << ")" << std::endl;
+            outfile.close();
+            return;
+        }
+
+        outfile << inFile.rdbuf();
+
+        inFile.close();
+        std::remove(piece_path.c_str());
+    }
+
+    outfile.close();
+}
+
+
+void downloadTorrent(const std::string& torrent, const std::string& output_path) {
+    auto info = decode_bencoded_info(torrent);
+    size_t num_pieces = (info.length + info.pLen -1) / info.pLen;
+
+    for (int piece_index = 0; piece_index < num_pieces ; ++piece_index) {
+        
+
+        auto fullUrl = constructUrlFromTorrent(torrent);
+        auto response = makeGetRequest(fullUrl);
+
+        auto ip_port = getIpAddress(response);
+        int sock = 0;
+        SendRecvHandShake(torrent, ip_port, sock);
+        std::string piece_path = output_path + "_piece_" + std::to_string(piece_index);
+
+        //std::cout << "downloading piece: " << piece_index << std::endl;
+        // Download the piece
+        downloadPiece(torrent, piece_index, piece_path, sock);
+        close(sock);
+    }
+
+    mergePieces(output_path, num_pieces);
+
+    std::cout << "Downloaded test.torrent to " << output_path << std::endl;
+}
+
 int main(int argc, char* argv[]) {
     if (argc < 3) {
         std::cerr << "Usage: " << argv[0] << " decode <encoded_value>" << std::endl;
@@ -665,6 +722,7 @@ int main(int argc, char* argv[]) {
         std::string ipaddress = argv[3];
         int sock;
         SendRecvHandShake(torrent, ipaddress, sock);
+        close(sock);
     } else if (command == "download_piece") {
         if (argc < 5) {
             std::cerr << "Usage: " << argv[0] << " download_piece -o <output_path> <torrent_file> <piece_index>" << std::endl;
@@ -673,13 +731,23 @@ int main(int argc, char* argv[]) {
         std::string output_path = argv[3]; // Assuming '-o' is argv[2]
         std::string torrent = argv[4];
         int piece_index = std::stoi(argv[5]);
+        int sock;
+        auto fullUrl = constructUrlFromTorrent(torrent);
+        auto response = makeGetRequest(fullUrl);
 
-        downloadPiece(torrent, piece_index, output_path);
+        auto ip_port = getIpAddress(response);
+        SendRecvHandShake(torrent, ip_port, sock);
+        downloadPiece(torrent, piece_index, output_path, sock);
+        close(sock);
     } else if (command == "download") {
         if (argc < 4) {
             std::cerr << "Usage: " << argv[0] << " download -o <output_path> <torrent_file>" << std::endl;
             return 1;
         }
+        std::string output_path = argv[3];
+        std::string torrent = argv[4];
+
+        downloadTorrent(torrent, output_path);
     } else {
         std::cerr << "unknown command: " << command << std::endl;
         return 1;
